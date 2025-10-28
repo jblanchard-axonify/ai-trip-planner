@@ -53,12 +53,13 @@ from langchain_community.vectorstores import InMemoryVectorStore
 import httpx
 
 
-class TripRequest(BaseModel):
-    destination: str
-    duration: str
+class MealPlanRequest(BaseModel):
+    dietary_restrictions: Optional[str] = None
+    preferences: Optional[str] = None
     budget: Optional[str] = None
-    interests: Optional[str] = None
-    travel_style: Optional[str] = None
+    num_people: int = 2
+    days: int = 7
+    health_goals: Optional[str] = None
     # Optional fields for enhanced session tracking and observability
     user_input: Optional[str] = None
     session_id: Optional[str] = None
@@ -66,7 +67,7 @@ class TripRequest(BaseModel):
     turn_index: Optional[int] = None
 
 
-class TripResponse(BaseModel):
+class MealPlanResponse(BaseModel):
     result: str
     tool_calls: List[Dict[str, Any]] = []
 
@@ -108,9 +109,9 @@ llm = _init_llm()
 ENABLE_RAG = os.getenv("ENABLE_RAG", "0").lower() not in {"0", "false", "no"}
 
 
-# RAG helper: Load curated local guides as LangChain documents
-def _load_local_documents(path: Path) -> List[Document]:
-    """Load local guides JSON and convert to LangChain Documents."""
+# RAG helper: Load curated recipes as LangChain documents
+def _load_recipe_documents(path: Path) -> List[Document]:
+    """Load recipes JSON and convert to LangChain Documents."""
     if not path.exists():
         return []
     try:
@@ -119,26 +120,47 @@ def _load_local_documents(path: Path) -> List[Document]:
         return []
 
     docs: List[Document] = []
-    for row in raw:
-        description = row.get("description")
-        city = row.get("city")
-        if not description or not city:
+    for recipe in raw:
+        name = recipe.get("name")
+        if not name:
             continue
-        interests = row.get("interests", []) or []
+        cuisine = recipe.get("cuisine", "")
+        dietary_tags = recipe.get("dietary_tags", []) or []
+        meal_type = recipe.get("meal_type", []) or []
+        nutrition = recipe.get("nutrition", {})
+        
         metadata = {
-            "city": city,
-            "interests": interests,
-            "source": row.get("source"),
+            "name": name,
+            "cuisine": cuisine,
+            "dietary_tags": dietary_tags,
+            "meal_type": meal_type,
+            "prep_time": recipe.get("prep_time", 0),
+            "cook_time": recipe.get("cook_time", 0),
+            "difficulty": recipe.get("difficulty", "medium"),
+            "calories": nutrition.get("calories", 0),
+            "protein": nutrition.get("protein", 0),
         }
-        # Prefix city + interests in content so embeddings capture location context
-        interest_text = ", ".join(interests) if interests else "general travel"
-        content = f"City: {city}\nInterests: {interest_text}\nGuide: {description}"
+        
+        # Build searchable content with dietary tags and meal types
+        tags_text = ", ".join(dietary_tags) if dietary_tags else "no restrictions"
+        meals_text = ", ".join(meal_type) if meal_type else "any meal"
+        ingredients_list = [ing.get("item", "") for ing in recipe.get("ingredients", [])]
+        ingredients_text = ", ".join(ingredients_list[:8])  # First 8 ingredients
+        
+        content = (
+            f"Recipe: {name}\n"
+            f"Cuisine: {cuisine}\n"
+            f"Dietary tags: {tags_text}\n"
+            f"Meal type: {meals_text}\n"
+            f"Ingredients: {ingredients_text}\n"
+            f"Calories: {nutrition.get('calories', 0)}, Protein: {nutrition.get('protein', 0)}g"
+        )
         docs.append(Document(page_content=content, metadata=metadata))
     return docs
 
 
-class LocalGuideRetriever:
-    """Retrieves curated local experiences using vector similarity search.
+class RecipeRetriever:
+    """Retrieves curated recipes using vector similarity search.
     
     This class demonstrates production RAG patterns for students:
     - Vector embeddings for semantic search
@@ -147,12 +169,12 @@ class LocalGuideRetriever:
     """
     
     def __init__(self, data_path: Path):
-        """Initialize retriever with local guides data.
+        """Initialize retriever with recipe data.
         
         Args:
-            data_path: Path to local_guides.json file
+            data_path: Path to recipes.json file
         """
-        self._docs = _load_local_documents(data_path)
+        self._docs = _load_recipe_documents(data_path)
         self._embeddings: Optional[OpenAIEmbeddings] = None
         self._vectorstore: Optional[InMemoryVectorStore] = None
         
@@ -174,12 +196,12 @@ class LocalGuideRetriever:
         """Check if any documents were loaded."""
         return not self._docs
 
-    def retrieve(self, destination: str, interests: Optional[str], *, k: int = 3) -> List[Dict[str, Any]]:
-        """Retrieve top-k relevant local guides for a destination.
+    def retrieve(self, preferences: Optional[str], dietary_restrictions: Optional[str], *, k: int = 5) -> List[Dict[str, Any]]:
+        """Retrieve top-k relevant recipes based on preferences and restrictions.
         
         Args:
-            destination: City or destination name
-            interests: Comma-separated interests (e.g., "food, art")
+            preferences: Cuisine preferences (e.g., "Italian, Asian")
+            dietary_restrictions: Dietary restrictions (e.g., "vegetarian, gluten-free")
             k: Number of results to return
             
         Returns:
@@ -190,18 +212,21 @@ class LocalGuideRetriever:
 
         # Use vector search if available, otherwise fall back to keywords
         if not self._vectorstore:
-            return self._keyword_fallback(destination, interests, k=k)
+            return self._keyword_fallback(preferences, dietary_restrictions, k=k)
 
-        query = destination
-        if interests:
-            query = f"{destination} with interests {interests}"
+        query_parts = []
+        if preferences:
+            query_parts.append(f"cuisine: {preferences}")
+        if dietary_restrictions:
+            query_parts.append(f"dietary: {dietary_restrictions}")
+        query = " ".join(query_parts) if query_parts else "healthy meal"
         
         try:
             # LangChain retriever ensures embeddings + searches are traced
-            retriever = self._vectorstore.as_retriever(search_kwargs={"k": max(k, 4)})
+            retriever = self._vectorstore.as_retriever(search_kwargs={"k": max(k, 8)})
             docs = retriever.invoke(query)
         except Exception:
-            return self._keyword_fallback(destination, interests, k=k)
+            return self._keyword_fallback(preferences, dietary_restrictions, k=k)
 
         # Format results with metadata and scores
         top_docs = docs[:k]
@@ -219,30 +244,38 @@ class LocalGuideRetriever:
             })
 
         if not results:
-            return self._keyword_fallback(destination, interests, k=k)
+            return self._keyword_fallback(preferences, dietary_restrictions, k=k)
         return results
 
-    def _keyword_fallback(self, destination: str, interests: Optional[str], *, k: int) -> List[Dict[str, Any]]:
+    def _keyword_fallback(self, preferences: Optional[str], dietary_restrictions: Optional[str], *, k: int) -> List[Dict[str, Any]]:
         """Simple keyword-based retrieval when embeddings unavailable.
         
         This demonstrates graceful degradation for students learning about
         fallback strategies in production systems.
         """
-        dest_lower = destination.lower()
-        interest_terms = [part.strip().lower() for part in (interests or "").split(",") if part.strip()]
+        pref_terms = [part.strip().lower() for part in (preferences or "").split(",") if part.strip()]
+        diet_terms = [part.strip().lower() for part in (dietary_restrictions or "").split(",") if part.strip()]
 
         def _score(doc: Document) -> int:
             score = 0
-            city_match = doc.metadata.get("city", "").lower()
-            # Match city name
-            if dest_lower and dest_lower.split(",")[0] in city_match:
-                score += 2
-            # Match interests
-            for term in interest_terms:
-                if term and term in " ".join(doc.metadata.get("interests") or []).lower():
+            content_lower = doc.page_content.lower()
+            dietary_tags = [tag.lower() for tag in doc.metadata.get("dietary_tags", [])]
+            cuisine_lower = doc.metadata.get("cuisine", "").lower()
+            
+            # Match dietary restrictions (high priority)
+            for term in diet_terms:
+                if term and term in " ".join(dietary_tags):
+                    score += 3
+                if term and term in content_lower:
+                    score += 2
+            
+            # Match cuisine preferences
+            for term in pref_terms:
+                if term and term in cuisine_lower:
+                    score += 2
+                if term and term in content_lower:
                     score += 1
-                if term and term in doc.page_content.lower():
-                    score += 1
+            
             return score
 
         scored_docs = [(_score(doc), doc) for doc in self._docs]
@@ -262,7 +295,7 @@ class LocalGuideRetriever:
 
 # Initialize retriever at module level (loads data once at startup)
 _DATA_DIR = Path(__file__).parent / "data"
-GUIDE_RETRIEVER = LocalGuideRetriever(_DATA_DIR / "local_guides.json")
+RECIPE_RETRIEVER = RecipeRetriever(_DATA_DIR / "recipes.json")
 
 
 # Search API configuration and helpers
@@ -357,7 +390,7 @@ def _llm_fallback(instruction: str, context: Optional[str] = None) -> str:
     if context:
         prompt += "\nContext:\n" + context.strip()
     response = llm.invoke([
-        SystemMessage(content="You are a concise travel assistant."),
+        SystemMessage(content="You are a concise meal planning assistant."),
         HumanMessage(content=prompt),
     ])
     return _compact(response.content)
@@ -371,177 +404,133 @@ def _with_prefix(prefix: str, summary: str) -> str:
 
 # Tools with real API calls + LLM fallback (graceful degradation pattern)
 @tool
-def essential_info(destination: str) -> str:
-    """Return essential destination info like weather, sights, and etiquette."""
-    query = f"{destination} travel essentials weather best time top attractions etiquette language currency safety"
+def calculate_nutrition(dietary_restrictions: Optional[str] = None, health_goals: Optional[str] = None, num_people: int = 2) -> str:
+    """Calculate daily nutritional targets based on health goals and restrictions."""
+    query = f"daily nutrition targets {health_goals or 'balanced diet'} {dietary_restrictions or ''} for {num_people} people"
     summary = _search_api(query)
     if summary:
-        return _with_prefix(f"{destination} essentials", summary)
+        return _with_prefix("Nutrition targets", summary)
     
-    # LLM fallback when no search API is configured
-    instruction = f"Summarize the climate, best visit time, standout sights, customs, language, currency, and safety tips for {destination}."
+    instruction = f"Provide daily calorie and macro targets (protein, carbs, fat) for {num_people} people with goals: {health_goals or 'maintenance'} and restrictions: {dietary_restrictions or 'none'}."
     return _llm_fallback(instruction)
 
 
 @tool
-def budget_basics(destination: str, duration: str) -> str:
-    """Return high-level budget categories for a given destination and duration."""
-    query = f"{destination} travel budget average daily costs {duration}"
+def get_dietary_guidelines(restrictions: str) -> str:
+    """Get dietary guidelines and considerations for specific restrictions or allergies."""
+    query = f"dietary guidelines {restrictions} meal planning nutrition advice"
     summary = _search_api(query)
     if summary:
-        return _with_prefix(f"{destination} budget {duration}", summary)
+        return _with_prefix(f"{restrictions} guidelines", summary)
     
-    instruction = f"Outline lodging, meals, transport, activities, and extra costs for a {duration} trip to {destination}."
+    instruction = f"Explain key nutritional considerations and guidelines for someone with {restrictions}."
     return _llm_fallback(instruction)
 
 
 @tool
-def local_flavor(destination: str, interests: Optional[str] = None) -> str:
-    """Suggest authentic local experiences matching optional interests."""
-    focus = interests or "local culture"
-    query = f"{destination} authentic local experiences {focus}"
+def search_recipes(cuisine: Optional[str] = None, dietary_tags: Optional[str] = None) -> str:
+    """Search for recipes matching cuisine preferences and dietary requirements."""
+    query = f"{cuisine or 'varied'} recipes {dietary_tags or 'healthy'} meal ideas"
     summary = _search_api(query)
     if summary:
-        return _with_prefix(f"{destination} {focus}", summary)
+        return _with_prefix(f"{cuisine or 'Recipe'} ideas", summary)
     
-    instruction = f"Recommend authentic local experiences in {destination} that highlight {focus}."
+    instruction = f"Suggest recipe ideas for {cuisine or 'various cuisines'} that are {dietary_tags or 'healthy and balanced'}."
     return _llm_fallback(instruction)
 
 
 @tool
-def day_plan(destination: str, day: int) -> str:
-    """Return a simple day plan outline for a specific day number."""
-    query = f"{destination} day {day} itinerary highlights"
+def get_ingredient_substitutions(ingredient: str, reason: str = "preference") -> str:
+    """Find ingredient substitutions for allergies, preferences, or availability."""
+    query = f"substitute for {ingredient} {reason} cooking alternatives"
     summary = _search_api(query)
     if summary:
-        return _with_prefix(f"Day {day} in {destination}", summary)
+        return _with_prefix(f"Substitute {ingredient}", summary)
     
-    instruction = f"Outline key activities for day {day} in {destination}, covering morning, afternoon, and evening."
-    return _llm_fallback(instruction)
-
-
-# Additional simple tools per agent (to mirror original multi-tool behavior)
-@tool
-def weather_brief(destination: str) -> str:
-    """Return a brief weather summary for planning purposes."""
-    query = f"{destination} weather forecast travel season temperatures rainfall"
-    summary = _search_api(query)
-    if summary:
-        return _with_prefix(f"{destination} weather", summary)
-    
-    instruction = f"Give a weather brief for {destination} noting season, temperatures, rainfall, humidity, and packing guidance."
+    instruction = f"Suggest substitutes for {ingredient} due to {reason}."
     return _llm_fallback(instruction)
 
 
 @tool
-def visa_brief(destination: str) -> str:
-    """Return a brief visa guidance for travel planning."""
-    query = f"{destination} tourist visa requirements entry rules"
+def estimate_grocery_costs(items: str, num_people: int = 2, days: int = 7) -> str:
+    """Estimate grocery costs for meal plan."""
+    query = f"average grocery cost {items} for {num_people} people {days} days"
     summary = _search_api(query)
     if summary:
-        return _with_prefix(f"{destination} visa", summary)
+        return _with_prefix(f"{days}-day grocery budget", summary)
     
-    instruction = f"Provide a visa guidance summary for visiting {destination}, including advice to confirm with the relevant embassy."
+    instruction = f"Estimate grocery costs for {num_people} people for {days} days including {items}."
     return _llm_fallback(instruction)
 
 
 @tool
-def attraction_prices(destination: str, attractions: Optional[List[str]] = None) -> str:
-    """Return pricing information for attractions."""
-    items = attractions or ["popular attractions"]
-    focus = ", ".join(items)
-    query = f"{destination} attraction ticket prices {focus}"
+def find_budget_alternatives(ingredient: str) -> str:
+    """Find budget-friendly alternatives to expensive ingredients."""
+    query = f"cheap alternative to {ingredient} budget grocery substitutes"
     summary = _search_api(query)
     if summary:
-        return _with_prefix(f"{destination} attraction prices", summary)
+        return _with_prefix(f"Budget alternative to {ingredient}", summary)
     
-    instruction = f"Share typical ticket prices and savings tips for attractions such as {focus} in {destination}."
+    instruction = f"Suggest affordable alternatives to {ingredient} that work well in cooking."
     return _llm_fallback(instruction)
 
 
 @tool
-def local_customs(destination: str) -> str:
-    """Return cultural etiquette and customs information."""
-    query = f"{destination} cultural etiquette travel customs"
-    summary = _search_api(query)
-    if summary:
-        return _with_prefix(f"{destination} customs", summary)
-    
-    instruction = f"Summarize key etiquette and cultural customs travelers should know before visiting {destination}."
+def organize_shopping_list(items: str) -> str:
+    """Organize shopping list by grocery store sections."""
+    instruction = f"Organize these items by grocery store section (produce, dairy, meat, pantry, frozen): {items}"
     return _llm_fallback(instruction)
 
 
 @tool
-def hidden_gems(destination: str) -> str:
-    """Return lesser-known attractions and experiences."""
-    query = f"{destination} hidden gems local secrets lesser known spots"
-    summary = _search_api(query)
-    if summary:
-        return _with_prefix(f"{destination} hidden gems", summary)
-    
-    instruction = f"List lesser-known attractions or experiences that feel like hidden gems in {destination}."
+def identify_pantry_staples(recipes: str) -> str:
+    """Identify which ingredients are pantry staples vs. fresh items."""
+    instruction = f"From these recipe ingredients, identify pantry staples vs fresh items: {recipes}"
     return _llm_fallback(instruction)
 
 
-@tool
-def travel_time(from_location: str, to_location: str, mode: str = "public") -> str:
-    """Return travel time estimates between locations."""
-    query = f"travel time {from_location} to {to_location} by {mode}"
-    summary = _search_api(query)
-    if summary:
-        return _with_prefix(f"{from_location}→{to_location} {mode}", summary)
-    
-    instruction = f"Estimate travel time from {from_location} to {to_location} by {mode} transport."
-    return _llm_fallback(instruction)
-
-
-@tool
-def packing_list(destination: str, duration: str, activities: Optional[List[str]] = None) -> str:
-    """Return packing recommendations for the trip."""
-    acts = ", ".join(activities or ["sightseeing"])
-    query = f"what to pack for {destination} {duration} {acts}"
-    summary = _search_api(query)
-    if summary:
-        return _with_prefix(f"{destination} packing", summary)
-    
-    instruction = f"Suggest packing essentials for a {duration} trip to {destination} focused on {acts}."
-    return _llm_fallback(instruction)
-
-
-class TripState(TypedDict):
+class MealPlanState(TypedDict):
     messages: Annotated[List[BaseMessage], operator.add]
-    trip_request: Dict[str, Any]
-    research: Optional[str]
+    meal_request: Dict[str, Any]
+    nutrition: Optional[str]
+    recipes: Optional[str]
     budget: Optional[str]
-    local: Optional[str]
-    final: Optional[str]
+    grocery: Optional[str]
+    final_plan: Optional[str]
     tool_calls: Annotated[List[Dict[str, Any]], operator.add]
 
 
-def research_agent(state: TripState) -> TripState:
-    req = state["trip_request"]
-    destination = req["destination"]
+def nutrition_agent(state: MealPlanState) -> MealPlanState:
+    req = state["meal_request"]
+    dietary_restrictions = req.get("dietary_restrictions", "none")
+    health_goals = req.get("health_goals", "balanced diet")
+    num_people = req.get("num_people", 2)
+    
     prompt_t = (
-        "You are a research assistant.\n"
-        "Gather essential information about {destination}.\n"
-        "Use tools to get weather, visa, and essential info, then summarize."
+        "You are a nutrition expert.\n"
+        "Analyze dietary needs for {num_people} people with restrictions: {dietary_restrictions}.\n"
+        "Health goals: {health_goals}.\n"
+        "Use tools to calculate nutrition targets and get dietary guidelines, then summarize."
     )
-    vars_ = {"destination": destination}
+    vars_ = {
+        "num_people": num_people,
+        "dietary_restrictions": dietary_restrictions,
+        "health_goals": health_goals
+    }
     
     messages = [SystemMessage(content=prompt_t.format(**vars_))]
-    tools = [essential_info, weather_brief, visa_brief]
+    tools = [calculate_nutrition, get_dietary_guidelines]
     agent = llm.bind_tools(tools)
     
     calls: List[Dict[str, Any]] = []
-    tool_results = []
     
     # Agent metadata and prompt template instrumentation
-    with using_attributes(tags=["research", "info_gathering"]):
+    with using_attributes(tags=["nutrition", "health_analysis"]):
         if _TRACING:
             current_span = trace.get_current_span()
             if current_span:
-                current_span.set_attribute("metadata.agent_type", "research")
-                current_span.set_attribute("metadata.agent_node", "research_agent")
+                current_span.set_attribute("metadata.agent_type", "nutrition")
+                current_span.set_attribute("metadata.agent_node", "nutrition_agent")
         
         with using_prompt_template(template=prompt_t, variables=vars_, version="v1"):
             res = agent.invoke(messages)
@@ -549,43 +538,44 @@ def research_agent(state: TripState) -> TripState:
     # Collect tool calls and execute them
     if getattr(res, "tool_calls", None):
         for c in res.tool_calls:
-            calls.append({"agent": "research", "tool": c["name"], "args": c.get("args", {})})
+            calls.append({"agent": "nutrition", "tool": c["name"], "args": c.get("args", {})})
         
         tool_node = ToolNode(tools)
         tr = tool_node.invoke({"messages": [res]})
-        tool_results = tr["messages"]
         
-        # Add tool results to conversation and ask LLM to synthesize
+        # Add tool results and ask for synthesis
         messages.append(res)
-        messages.extend(tool_results)
+        messages.extend(tr["messages"])
         
-        synthesis_prompt = "Based on the above information, provide a comprehensive summary for the traveler."
+        synthesis_prompt = f"Provide a comprehensive nutritional summary for {num_people} people with {dietary_restrictions} restrictions and {health_goals} goals."
         messages.append(SystemMessage(content=synthesis_prompt))
         
-        # Instrument synthesis LLM call with its own prompt template
-        synthesis_vars = {"destination": destination, "context": "tool_results"}
+        # Instrument synthesis LLM call
+        synthesis_vars = {"num_people": num_people, "dietary_restrictions": dietary_restrictions, "health_goals": health_goals}
         with using_prompt_template(template=synthesis_prompt, variables=synthesis_vars, version="v1-synthesis"):
             final_res = llm.invoke(messages)
         out = final_res.content
     else:
         out = res.content
 
-    return {"messages": [SystemMessage(content=out)], "research": out, "tool_calls": calls}
+    return {"messages": [SystemMessage(content=out)], "nutrition": out, "tool_calls": calls}
 
 
-def budget_agent(state: TripState) -> TripState:
-    req = state["trip_request"]
-    destination, duration = req["destination"], req["duration"]
+def budget_agent(state: MealPlanState) -> MealPlanState:
+    req = state["meal_request"]
+    num_people = req.get("num_people", 2)
+    days = req.get("days", 7)
     budget = req.get("budget", "moderate")
+    
     prompt_t = (
         "You are a budget analyst.\n"
-        "Analyze costs for {destination} over {duration} with budget: {budget}.\n"
-        "Use tools to get pricing information, then provide a detailed breakdown."
+        "Estimate grocery costs for {num_people} people over {days} days with a {budget} budget.\n"
+        "Use tools to estimate costs and suggest budget-friendly alternatives."
     )
-    vars_ = {"destination": destination, "duration": duration, "budget": budget}
+    vars_ = {"num_people": num_people, "days": days, "budget": budget}
     
     messages = [SystemMessage(content=prompt_t.format(**vars_))]
-    tools = [budget_basics, attraction_prices]
+    tools = [estimate_grocery_costs, find_budget_alternatives]
     agent = llm.bind_tools(tools)
     
     calls: List[Dict[str, Any]] = []
@@ -612,11 +602,11 @@ def budget_agent(state: TripState) -> TripState:
         messages.append(res)
         messages.extend(tr["messages"])
         
-        synthesis_prompt = f"Create a detailed budget breakdown for {duration} in {destination} with a {budget} budget."
+        synthesis_prompt = f"Create a detailed grocery budget estimate for {num_people} people over {days} days with a {budget} budget."
         messages.append(SystemMessage(content=synthesis_prompt))
         
         # Instrument synthesis LLM call
-        synthesis_vars = {"duration": duration, "destination": destination, "budget": budget}
+        synthesis_vars = {"num_people": num_people, "days": days, "budget": budget}
         with using_prompt_template(template=synthesis_prompt, variables=synthesis_vars, version="v1-synthesis"):
             final_res = llm.invoke(messages)
         out = final_res.content
@@ -626,57 +616,57 @@ def budget_agent(state: TripState) -> TripState:
     return {"messages": [SystemMessage(content=out)], "budget": out, "tool_calls": calls}
 
 
-def local_agent(state: TripState) -> TripState:
-    req = state["trip_request"]
-    destination = req["destination"]
-    interests = req.get("interests", "local culture")
-    travel_style = req.get("travel_style", "standard")
+def recipe_agent(state: MealPlanState) -> MealPlanState:
+    req = state["meal_request"]
+    preferences = req.get("preferences", "varied cuisines")
+    dietary_restrictions = req.get("dietary_restrictions", "none")
+    days = req.get("days", 7)
     
-    # RAG: Retrieve curated local guides if enabled
+    # RAG: Retrieve curated recipes if enabled
     context_lines = []
     if ENABLE_RAG:
-        retrieved = GUIDE_RETRIEVER.retrieve(destination, interests, k=3)
+        retrieved = RECIPE_RETRIEVER.retrieve(preferences, dietary_restrictions, k=5)
         if retrieved:
-            context_lines.append("=== Curated Local Guides (from database) ===")
+            context_lines.append("=== Curated Recipes (from database) ===")
             for idx, item in enumerate(retrieved, 1):
                 content = item["content"]
-                source = item["metadata"].get("source", "Unknown")
+                name = item["metadata"].get("name", "Recipe")
                 context_lines.append(f"{idx}. {content}")
-                context_lines.append(f"   Source: {source}")
-            context_lines.append("=== End of Curated Guides ===\n")
+            context_lines.append("=== End of Curated Recipes ===\n")
     
     context_text = "\n".join(context_lines) if context_lines else ""
     
     prompt_t = (
-        "You are a local guide.\n"
-        "Find authentic experiences in {destination} for someone interested in: {interests}.\n"
-        "Travel style: {travel_style}. Use tools to gather local insights.\n"
+        "You are a chef and recipe specialist.\n"
+        "Find recipes for a {days}-day meal plan matching preferences: {preferences}.\n"
+        "Dietary restrictions: {dietary_restrictions}. Use tools to search for recipes.\n"
+        "Ensure variety across cuisines and cooking methods.\n"
     )
     
     # Add retrieved context to prompt if available
     if context_text:
-        prompt_t += "\nRelevant curated experiences from our database:\n{context}\n"
+        prompt_t += "\nRelevant curated recipes from our database:\n{context}\n"
     
     vars_ = {
-        "destination": destination,
-        "interests": interests,
-        "travel_style": travel_style,
-        "context": context_text if context_text else "No curated context available.",
+        "preferences": preferences,
+        "dietary_restrictions": dietary_restrictions,
+        "days": days,
+        "context": context_text if context_text else "No curated recipes available.",
     }
     
     messages = [SystemMessage(content=prompt_t.format(**vars_))]
-    tools = [local_flavor, local_customs, hidden_gems]
+    tools = [search_recipes, get_ingredient_substitutions]
     agent = llm.bind_tools(tools)
     
     calls: List[Dict[str, Any]] = []
     
     # Agent metadata and prompt template instrumentation
-    with using_attributes(tags=["local", "local_experiences"]):
+    with using_attributes(tags=["recipe", "meal_selection"]):
         if _TRACING:
             current_span = trace.get_current_span()
             if current_span:
-                current_span.set_attribute("metadata.agent_type", "local")
-                current_span.set_attribute("metadata.agent_node", "local_agent")
+                current_span.set_attribute("metadata.agent_type", "recipe")
+                current_span.set_attribute("metadata.agent_node", "recipe_agent")
                 if ENABLE_RAG and context_text:
                     current_span.set_attribute("metadata.rag_enabled", "true")
         
@@ -685,7 +675,7 @@ def local_agent(state: TripState) -> TripState:
     
     if getattr(res, "tool_calls", None):
         for c in res.tool_calls:
-            calls.append({"agent": "local", "tool": c["name"], "args": c.get("args", {})})
+            calls.append({"agent": "recipe", "tool": c["name"], "args": c.get("args", {})})
         
         tool_node = ToolNode(tools)
         tr = tool_node.invoke({"messages": [res]})
@@ -694,58 +684,131 @@ def local_agent(state: TripState) -> TripState:
         messages.append(res)
         messages.extend(tr["messages"])
         
-        synthesis_prompt = f"Create a curated list of authentic experiences for someone interested in {interests} with a {travel_style} approach."
+        synthesis_prompt = f"Create a curated list of {days * 3} recipes (breakfast, lunch, dinner) matching {preferences} and {dietary_restrictions}."
         messages.append(SystemMessage(content=synthesis_prompt))
         
         # Instrument synthesis LLM call
-        synthesis_vars = {"interests": interests, "travel_style": travel_style, "destination": destination}
+        synthesis_vars = {"preferences": preferences, "dietary_restrictions": dietary_restrictions, "days": days}
         with using_prompt_template(template=synthesis_prompt, variables=synthesis_vars, version="v1-synthesis"):
             final_res = llm.invoke(messages)
         out = final_res.content
     else:
         out = res.content
 
-    return {"messages": [SystemMessage(content=out)], "local": out, "tool_calls": calls}
+    return {"messages": [SystemMessage(content=out)], "recipes": out, "tool_calls": calls}
 
 
-def itinerary_agent(state: TripState) -> TripState:
-    req = state["trip_request"]
-    destination = req["destination"]
-    duration = req["duration"]
-    travel_style = req.get("travel_style", "standard")
+def grocery_agent(state: MealPlanState) -> MealPlanState:
+    req = state["meal_request"]
+    num_people = req.get("num_people", 2)
+    days = req.get("days", 7)
+    
+    # Get recipes from previous agent
+    recipes_info = state.get("recipes", "")
+    
+    prompt_t = (
+        "You are a grocery shopping expert.\n"
+        "Create a consolidated shopping list for {num_people} people over {days} days.\n"
+        "Organize items by store section and identify pantry staples vs fresh items.\n"
+        "Use the recipes provided to extract ingredients.\n"
+    )
+    vars_ = {"num_people": num_people, "days": days}
+    
+    messages = [SystemMessage(content=prompt_t.format(**vars_))]
+    if recipes_info:
+        messages.append(SystemMessage(content=f"Recipes to shop for:\n{recipes_info[:500]}"))
+    
+    tools = [organize_shopping_list, identify_pantry_staples]
+    agent = llm.bind_tools(tools)
+    
+    calls: List[Dict[str, Any]] = []
+    
+    # Agent metadata and prompt template instrumentation
+    with using_attributes(tags=["grocery", "shopping_list"]):
+        if _TRACING:
+            current_span = trace.get_current_span()
+            if current_span:
+                current_span.set_attribute("metadata.agent_type", "grocery")
+                current_span.set_attribute("metadata.agent_node", "grocery_agent")
+        
+        with using_prompt_template(template=prompt_t, variables=vars_, version="v1"):
+            res = agent.invoke(messages)
+    
+    if getattr(res, "tool_calls", None):
+        for c in res.tool_calls:
+            calls.append({"agent": "grocery", "tool": c["name"], "args": c.get("args", {})})
+        
+        tool_node = ToolNode(tools)
+        tr = tool_node.invoke({"messages": [res]})
+        
+        # Add tool results and ask for synthesis
+        messages.append(res)
+        messages.extend(tr["messages"])
+        
+        synthesis_prompt = f"Create a well-organized shopping list for {num_people} people for {days} days, organized by store section."
+        messages.append(SystemMessage(content=synthesis_prompt))
+        
+        # Instrument synthesis LLM call
+        synthesis_vars = {"num_people": num_people, "days": days}
+        with using_prompt_template(template=synthesis_prompt, variables=synthesis_vars, version="v1-synthesis"):
+            final_res = llm.invoke(messages)
+        out = final_res.content
+    else:
+        out = res.content
+
+    return {"messages": [SystemMessage(content=out)], "grocery": out, "tool_calls": calls}
+
+
+def meal_plan_synthesizer(state: MealPlanState) -> MealPlanState:
+    req = state["meal_request"]
+    num_people = req.get("num_people", 2)
+    days = req.get("days", 7)
+    dietary_restrictions = req.get("dietary_restrictions", "none")
+    preferences = req.get("preferences", "varied")
     user_input = (req.get("user_input") or "").strip()
     
     prompt_parts = [
-        "Create a {duration} itinerary for {destination} ({travel_style}).",
+        "Create a comprehensive {days}-day meal plan for {num_people} people.",
+        "Dietary restrictions: {dietary_restrictions}",
+        "Preferences: {preferences}",
         "",
-        "Inputs:",
-        "Research: {research}",
+        "Inputs from specialist agents:",
+        "Nutrition: {nutrition}",
+        "Recipes: {recipes}",
         "Budget: {budget}",
-        "Local: {local}",
+        "Shopping List: {grocery}",
+        "",
+        "Synthesize all inputs into a day-by-day meal plan with:",
+        "- Breakfast, lunch, dinner for each day",
+        "- Nutritional balance across the week",
+        "- Shopping list organized by category",
+        "- Weekly prep tips and timing guidance",
     ]
     if user_input:
-        prompt_parts.append("User input: {user_input}")
+        prompt_parts.append("Additional user notes: {user_input}")
     
     prompt_t = "\n".join(prompt_parts)
     vars_ = {
-        "duration": duration,
-        "destination": destination,
-        "travel_style": travel_style,
-        "research": (state.get("research") or "")[:400],
+        "days": days,
+        "num_people": num_people,
+        "dietary_restrictions": dietary_restrictions,
+        "preferences": preferences,
+        "nutrition": (state.get("nutrition") or "")[:400],
+        "recipes": (state.get("recipes") or "")[:400],
         "budget": (state.get("budget") or "")[:400],
-        "local": (state.get("local") or "")[:400],
+        "grocery": (state.get("grocery") or "")[:400],
         "user_input": user_input,
     }
     
     # Add span attributes for better observability in Arize
     # NOTE: using_attributes must be OUTER context for proper propagation
-    with using_attributes(tags=["itinerary", "final_agent"]):
+    with using_attributes(tags=["meal_plan", "final_agent"]):
         if _TRACING:
             current_span = trace.get_current_span()
             if current_span:
-                current_span.set_attribute("metadata.itinerary", "true")
-                current_span.set_attribute("metadata.agent_type", "itinerary")
-                current_span.set_attribute("metadata.agent_node", "itinerary_agent")
+                current_span.set_attribute("metadata.meal_plan_synthesizer", "true")
+                current_span.set_attribute("metadata.agent_type", "meal_plan")
+                current_span.set_attribute("metadata.agent_node", "meal_plan_synthesizer")
                 if user_input:
                     current_span.set_attribute("metadata.user_input", user_input)
         
@@ -753,33 +816,36 @@ def itinerary_agent(state: TripState) -> TripState:
         with using_prompt_template(template=prompt_t, variables=vars_, version="v1"):
             res = llm.invoke([SystemMessage(content=prompt_t.format(**vars_))])
     
-    return {"messages": [SystemMessage(content=res.content)], "final": res.content}
+    return {"messages": [SystemMessage(content=res.content)], "final_plan": res.content}
 
 
 def build_graph():
-    g = StateGraph(TripState)
-    g.add_node("research_node", research_agent)
+    g = StateGraph(MealPlanState)
+    g.add_node("nutrition_node", nutrition_agent)
+    g.add_node("recipe_node", recipe_agent)
     g.add_node("budget_node", budget_agent)
-    g.add_node("local_node", local_agent)
-    g.add_node("itinerary_node", itinerary_agent)
+    g.add_node("grocery_node", grocery_agent)
+    g.add_node("synthesizer_node", meal_plan_synthesizer)
 
-    # Run research, budget, and local agents in parallel
-    g.add_edge(START, "research_node")
+    # Run nutrition, recipe, budget, and grocery agents in parallel
+    g.add_edge(START, "nutrition_node")
+    g.add_edge(START, "recipe_node")
     g.add_edge(START, "budget_node")
-    g.add_edge(START, "local_node")
+    g.add_edge(START, "grocery_node")
     
-    # All three agents feed into the itinerary agent
-    g.add_edge("research_node", "itinerary_node")
-    g.add_edge("budget_node", "itinerary_node")
-    g.add_edge("local_node", "itinerary_node")
+    # All four agents feed into the meal plan synthesizer
+    g.add_edge("nutrition_node", "synthesizer_node")
+    g.add_edge("recipe_node", "synthesizer_node")
+    g.add_edge("budget_node", "synthesizer_node")
+    g.add_edge("grocery_node", "synthesizer_node")
     
-    g.add_edge("itinerary_node", END)
+    g.add_edge("synthesizer_node", END)
 
     # Compile without checkpointer to avoid state persistence issues
     return g.compile()
 
 
-app = FastAPI(title="AI Trip Planner")
+app = FastAPI(title="SmartMeal Planner")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -800,7 +866,7 @@ def serve_frontend():
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "service": "ai-trip-planner"}
+    return {"status": "healthy", "service": "smartmeal-planner"}
 
 
 # Initialize tracing once at startup, not per request
@@ -809,21 +875,21 @@ if _TRACING:
         space_id = os.getenv("ARIZE_SPACE_ID")
         api_key = os.getenv("ARIZE_API_KEY")
         if space_id and api_key:
-            tp = register(space_id=space_id, api_key=api_key, project_name="ai-trip-planner")
+            tp = register(space_id=space_id, api_key=api_key, project_name="smartmeal-planner")
             LangChainInstrumentor().instrument(tracer_provider=tp, include_chains=True, include_agents=True, include_tools=True)
             LiteLLMInstrumentor().instrument(tracer_provider=tp, skip_dep_check=True)
     except Exception:
         pass
 
-@app.post("/plan-trip", response_model=TripResponse)
-def plan_trip(req: TripRequest):
+@app.post("/plan-meal", response_model=MealPlanResponse)
+def plan_meal(req: MealPlanRequest):
     graph = build_graph()
     
     # Only include necessary fields in initial state
-    # Agent outputs (research, budget, local, final) will be added during execution
+    # Agent outputs (nutrition, recipes, budget, grocery, final_plan) will be added during execution
     state = {
         "messages": [],
-        "trip_request": req.model_dump(),
+        "meal_request": req.model_dump(),
         "tool_calls": [],
     }
     
@@ -850,7 +916,7 @@ def plan_trip(req: TripRequest):
         with using_attributes(**attrs_kwargs):
             out = graph.invoke(state)
     
-    return TripResponse(result=out.get("final", ""), tool_calls=out.get("tool_calls", []))
+    return MealPlanResponse(result=out.get("final_plan", ""), tool_calls=out.get("tool_calls", []))
 
 
 if __name__ == "__main__":
