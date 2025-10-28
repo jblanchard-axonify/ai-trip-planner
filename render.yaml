@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: ai-trip-planner-backend
+    name: smartmeal-planner-backend
     env: python
     plan: free
     rootDir: backend
@@ -20,6 +20,8 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
+      - key: ENABLE_RAG
+        value: 1
       - key: OPENAI_API_KEY
         sync: false
       - key: OPENROUTER_API_KEY
